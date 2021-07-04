@@ -78,7 +78,6 @@ impl Requester {
 	///
 	/// You must feed it with `ActiveLeavesUpdate` via `update_fetching_heads` and make it progress
 	/// by advancing the stream.
-	#[tracing::instrument(level = "trace", skip(metrics), fields(subsystem = LOG_TARGET))]
 	pub fn new(metrics: Metrics) -> Self {
 		let (tx, rx) = mpsc::channel(1);
 		Requester {
@@ -91,8 +90,7 @@ impl Requester {
 	}
 	/// Update heads that need availability distribution.
 	///
-	/// For all active heads we will be fetching our chunks for availabilty distribution.
-	#[tracing::instrument(level = "trace", skip(self, ctx, runtime, update), fields(subsystem = LOG_TARGET))]
+	/// For all active heads we will be fetching our chunks for availability distribution.
 	pub async fn update_fetching_heads<Context>(
 		&mut self,
 		ctx: &mut Context,

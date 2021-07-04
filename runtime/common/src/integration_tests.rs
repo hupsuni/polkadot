@@ -41,7 +41,7 @@ use crate::{
 	auctions, crowdloan, slots, paras_registrar,
 	slot_range::SlotRange,
 	traits::{
-		Registrar as RegistrarT, Auctioneer,
+		Registrar as RegistrarT, Auctioneer, AuctionStatus,
 	},
 };
 
@@ -144,6 +144,7 @@ impl pallet_timestamp::Config for Test {
 
 parameter_types! {
 	pub static ExistentialDeposit: Balance = 1;
+	pub const MaxReserves: u32 = 50;
 }
 
 impl pallet_balances::Config for Test {
@@ -154,6 +155,8 @@ impl pallet_balances::Config for Test {
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
 	type WeightInfo = ();
+	type MaxReserves = MaxReserves;
+	type ReserveIdentifier = [u8; 8];
 }
 
 impl configuration::Config for Test { }
@@ -168,8 +171,6 @@ impl paras::Config for Test {
 parameter_types! {
 	pub const ParaDeposit: Balance = 500;
 	pub const DataDepositPerByte: Balance = 1;
-	pub const MaxCodeSize: u32 = 200;
-	pub const MaxHeadSize: u32 = 100;
 }
 
 impl paras_registrar::Config for Test {
@@ -177,8 +178,6 @@ impl paras_registrar::Config for Test {
 	type OnSwap = (Crowdloan, Slots);
 	type ParaDeposit = ParaDeposit;
 	type DataDepositPerByte = DataDepositPerByte;
-	type MaxCodeSize = MaxCodeSize;
-	type MaxHeadSize = MaxHeadSize;
 	type Currency = Balances;
 	type Origin = Origin;
 	type WeightInfo = crate::paras_registrar::TestWeightInfo;
@@ -216,7 +215,6 @@ parameter_types! {
 	pub const CrowdloanId: PalletId = PalletId(*b"py/cfund");
 	pub const SubmissionDeposit: Balance = 100;
 	pub const MinContribution: Balance = 1;
-	pub const RetirementPeriod: BlockNumber = 10;
 	pub const RemoveKeysLimit: u32 = 100;
 	pub const MaxMemoLength: u8 = 32;
 }
@@ -235,7 +233,14 @@ impl crowdloan::Config for Test {
 
 /// Create a new set of test externalities.
 pub fn new_test_ext() -> TestExternalities {
-	let t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+	let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+	configuration::GenesisConfig::<Test> {
+		config: configuration::HostConfiguration {
+			max_code_size: 2 * 1024 * 1024, // 2 MB
+			max_head_data_size: 1 * 1024 * 1024, // 1 MB
+			..Default::default()
+		},
+	}.assimilate_storage(&mut t).unwrap();
 	let keystore = KeyStore::new();
 	let mut ext: sp_io::TestExternalities = t.into();
 	ext.register_extension(KeystoreExt(Arc::new(keystore)));
@@ -296,17 +301,19 @@ fn basic_end_to_end_works() {
 		let para_2 = LOWEST_PUBLIC_ID + 1;
 		assert!(System::block_number().is_one());
 		// User 1 and 2 will own parachains
-		Balances::make_free_balance_be(&1, 1_000);
-		Balances::make_free_balance_be(&2, 1_000);
+		Balances::make_free_balance_be(&1, 1_000_000_000);
+		Balances::make_free_balance_be(&2, 1_000_000_000);
 		// First register 2 parathreads
 		let genesis_head = Registrar::worst_head_data();
 		let validation_code = Registrar::worst_validation_code();
+		assert_ok!(Registrar::reserve(Origin::signed(1)));
 		assert_ok!(Registrar::register(
 			Origin::signed(1),
 			ParaId::from(para_1),
 			genesis_head.clone(),
 			validation_code.clone(),
 		));
+		assert_ok!(Registrar::reserve(Origin::signed(2)));
 		assert_ok!(Registrar::register(
 			Origin::signed(2),
 			ParaId::from(2001),
@@ -344,8 +351,8 @@ fn basic_end_to_end_works() {
 		// Auction ending begins on block 100, so we make a bid before then.
 		run_to_block(90);
 
-		Balances::make_free_balance_be(&10, 1_000);
-		Balances::make_free_balance_be(&20, 1_000);
+		Balances::make_free_balance_be(&10, 1_000_000_000);
+		Balances::make_free_balance_be(&20, 1_000_000_000);
 
 		// User 10 will bid directly for parachain 1
 		assert_ok!(Auctions::bid(
@@ -358,19 +365,19 @@ fn basic_end_to_end_works() {
 		));
 
 		// User 2 will be a contribute to crowdloan for parachain 2
-		Balances::make_free_balance_be(&2, 1_000);
+		Balances::make_free_balance_be(&2, 1_000_000_000);
 		assert_ok!(Crowdloan::contribute(Origin::signed(2), ParaId::from(para_2), 920, None));
 
 		// Auction ends at block 110
 		run_to_block(109);
 		assert_eq!(
 			last_event(),
-			crowdloan::RawEvent::HandleBidResult(ParaId::from(para_2), Ok(())).into(),
+			crowdloan::Event::<Test>::HandleBidResult(ParaId::from(para_2), Ok(())).into(),
 		);
 		run_to_block(110);
 		assert_eq!(
 			last_event(),
-			auctions::RawEvent::AuctionClosed(1).into(),
+			auctions::Event::<Test>::AuctionClosed(1).into(),
 		);
 
 		// Paras should have won slots
@@ -386,7 +393,7 @@ fn basic_end_to_end_works() {
 		);
 
 		// Should not be able to contribute to a winning crowdloan
-		Balances::make_free_balance_be(&3, 1_000);
+		Balances::make_free_balance_be(&3, 1_000_000_000);
 		assert_noop!(Crowdloan::contribute(Origin::signed(3), ParaId::from(2001), 10, None), CrowdloanError::<Test>::BidOrLeaseActive);
 
 		// New leases will start on block 400
@@ -440,23 +447,25 @@ fn basic_errors_fail() {
 		assert!(System::block_number().is_one());
 		let para_id = LOWEST_PUBLIC_ID;
 		// Can't double register
-		Balances::make_free_balance_be(&1, 1_000);
-		Balances::make_free_balance_be(&2, 1_000);
+		Balances::make_free_balance_be(&1, 1_000_000_000);
+		Balances::make_free_balance_be(&2, 1_000_000_000);
 
 		let genesis_head = Registrar::worst_head_data();
 		let validation_code = Registrar::worst_validation_code();
+		assert_ok!(Registrar::reserve(Origin::signed(1)));
 		assert_ok!(Registrar::register(
 			Origin::signed(1),
 			para_id,
 			genesis_head.clone(),
 			validation_code.clone(),
 		));
+		assert_ok!(Registrar::reserve(Origin::signed(2)));
 		assert_noop!(Registrar::register(
 			Origin::signed(2),
 			para_id,
 			genesis_head,
 			validation_code,
-		), paras_registrar::Error::<Test>::InvalidParaId);
+		), paras_registrar::Error::<Test>::NotOwner);
 
 		// Start an auction
 		let duration = 99u32;
@@ -486,9 +495,10 @@ fn competing_slots() {
 
 		// Create n paras and owners
 		for n in 1 ..= max_bids {
-			Balances::make_free_balance_be(&n, 1_000);
+			Balances::make_free_balance_be(&n, 1_000_000_000);
 			let genesis_head = Registrar::worst_head_data();
 			let validation_code = Registrar::worst_validation_code();
+			assert_ok!(Registrar::reserve(Origin::signed(n)));
 			assert_ok!(Registrar::register(
 				Origin::signed(n),
 				para_id + n - 1,
@@ -566,24 +576,32 @@ fn competing_bids() {
 	// This test will verify that competing bids, from different sources will resolve appropriately.
 	new_test_ext().execute_with(|| {
 		assert!(System::block_number().is_one());
-		// Start a new auction in the future
-		let duration = 99u32;
-		let lease_period_index_start = 4u32;
-		assert_ok!(Auctions::new_auction(Origin::root(), duration, lease_period_index_start));
 
 		let start_para = LOWEST_PUBLIC_ID - 1;
 		// Create 3 paras and owners
 		for n in 1 ..= 3 {
-			Balances::make_free_balance_be(&n, 1_000);
+			Balances::make_free_balance_be(&n, 1_000_000_000);
 			let genesis_head = Registrar::worst_head_data();
 			let validation_code = Registrar::worst_validation_code();
+			assert_ok!(Registrar::reserve(Origin::signed(n)));
 			assert_ok!(Registrar::register(
 				Origin::signed(n),
 				ParaId::from(start_para + n),
 				genesis_head,
 				validation_code,
 			));
+		}
 
+		// Finish registration of paras.
+		run_to_session(2);
+
+		// Start a new auction in the future
+		let starting_block = System::block_number();
+		let duration = 99u32;
+		let lease_period_index_start = 4u32;
+		assert_ok!(Auctions::new_auction(Origin::root(), duration, lease_period_index_start));
+
+		for n in 1 ..= 3 {
 			// Create a crowdloan for each para
 			assert_ok!(Crowdloan::create(
 				Origin::signed(n),
@@ -598,7 +616,7 @@ fn competing_bids() {
 
 		for n in 1 ..= 9 {
 			// Increment block number
-			run_to_block(n * 10);
+			run_to_block(starting_block + n * 10);
 
 			Balances::make_free_balance_be(&(n * 10), n * 1_000);
 
@@ -626,7 +644,7 @@ fn competing_bids() {
 		}
 
 		// Auction should be done
-		run_to_block(110);
+		run_to_block(starting_block + 110);
 
 		// Appropriate Paras should have won slots
 		let crowdloan_2 = Crowdloan::fund_account_id(ParaId::from(2001));
@@ -649,15 +667,17 @@ fn basic_swap_works() {
 	new_test_ext().execute_with(|| {
 		assert!(System::block_number().is_one()); // So events are emitted
 		// User 1 and 2 will own paras
-		Balances::make_free_balance_be(&1, 1_000);
-		Balances::make_free_balance_be(&2, 1_000);
+		Balances::make_free_balance_be(&1, 1_000_000_000);
+		Balances::make_free_balance_be(&2, 1_000_000_000);
 		// First register 2 parathreads with different data
+		assert_ok!(Registrar::reserve(Origin::signed(1)));
 		assert_ok!(Registrar::register(
 			Origin::signed(1),
 			ParaId::from(2000),
 			test_genesis_head(10),
 			test_validation_code(10),
 		));
+		assert_ok!(Registrar::reserve(Origin::signed(2)));
 		assert_ok!(Registrar::register(
 			Origin::signed(2),
 			ParaId::from(2001),
@@ -694,7 +714,7 @@ fn basic_swap_works() {
 		// Bunch of contributions
 		let mut total = 0;
 		for i in 10 .. 20 {
-			Balances::make_free_balance_be(&i, 1_000);
+			Balances::make_free_balance_be(&i, 1_000_000_000);
 			assert_ok!(Crowdloan::contribute(Origin::signed(i), ParaId::from(2000), 900 - i, None));
 			total += 900 - i;
 		}
@@ -780,15 +800,17 @@ fn crowdloan_ending_period_bid() {
 	new_test_ext().execute_with(|| {
 		assert!(System::block_number().is_one()); // So events are emitted
 		// User 1 and 2 will own paras
-		Balances::make_free_balance_be(&1, 1_000);
-		Balances::make_free_balance_be(&2, 1_000);
+		Balances::make_free_balance_be(&1, 1_000_000_000);
+		Balances::make_free_balance_be(&2, 1_000_000_000);
 		// First register 2 parathreads
+		assert_ok!(Registrar::reserve(Origin::signed(1)));
 		assert_ok!(Registrar::register(
 			Origin::signed(1),
 			ParaId::from(2000),
 			test_genesis_head(10),
 			test_validation_code(10),
 		));
+		assert_ok!(Registrar::reserve(Origin::signed(2)));
 		assert_ok!(Registrar::register(
 			Origin::signed(2),
 			ParaId::from(2001),
@@ -825,7 +847,7 @@ fn crowdloan_ending_period_bid() {
 		// Bunch of contributions
 		let mut total = 0;
 		for i in 10 .. 20 {
-			Balances::make_free_balance_be(&i, 1_000);
+			Balances::make_free_balance_be(&i, 1_000_000_000);
 			assert_ok!(Crowdloan::contribute(Origin::signed(i), ParaId::from(2000), 900 - i, None));
 			total += 900 - i;
 		}
@@ -833,7 +855,7 @@ fn crowdloan_ending_period_bid() {
 		assert_eq!(Balances::free_balance(&crowdloan_account), total);
 
 		// Bid for para 2 directly
-		Balances::make_free_balance_be(&2, 1_000);
+		Balances::make_free_balance_be(&2, 1_000_000_000);
 		assert_ok!(Auctions::bid(
 			Origin::signed(2),
 			ParaId::from(2001),
@@ -846,7 +868,7 @@ fn crowdloan_ending_period_bid() {
 		// Go to beginning of ending period
 		run_to_block(100);
 
-		assert_eq!(Auctions::is_ending(100), Some(0));
+		assert_eq!(Auctions::auction_status(100), AuctionStatus::<u32>::EndingPeriod(0, 0));
 		let mut winning = [None; SlotRange::SLOT_RANGE_COUNT];
 		winning[SlotRange::ZeroOne as u8 as usize] = Some((2, ParaId::from(2001), 900));
 		winning[SlotRange::ZeroThree as u8 as usize] = Some((crowdloan_account, ParaId::from(2000), total));
@@ -855,7 +877,7 @@ fn crowdloan_ending_period_bid() {
 
 		run_to_block(101);
 
-		Balances::make_free_balance_be(&1234, 1_000);
+		Balances::make_free_balance_be(&1234, 1_000_000_000);
 		assert_ok!(Crowdloan::contribute(Origin::signed(1234), ParaId::from(2000), 900, None));
 
 		// Data propagates correctly
@@ -878,7 +900,7 @@ fn auction_bid_requires_registered_para() {
 		assert_ok!(Auctions::new_auction(Origin::root(), duration, lease_period_index_start));
 
 		// Can't bid with non-registered paras
-		Balances::make_free_balance_be(&1, 1_000);
+		Balances::make_free_balance_be(&1, 1_000_000_000);
 		assert_noop!(Auctions::bid(
 			Origin::signed(1),
 			ParaId::from(2000),
@@ -889,6 +911,7 @@ fn auction_bid_requires_registered_para() {
 		), AuctionsError::<Test>::ParaNotRegistered);
 
 		// Now we register the para
+		assert_ok!(Registrar::reserve(Origin::signed(1)));
 		assert_ok!(Registrar::register(
 			Origin::signed(1),
 			ParaId::from(2000),
@@ -910,7 +933,7 @@ fn auction_bid_requires_registered_para() {
 		run_to_session(2);
 
 		// Success
-		Balances::make_free_balance_be(&1, 1_000);
+		Balances::make_free_balance_be(&1, 1_000_000_000);
 		assert_ok!(Auctions::bid(
 			Origin::signed(1),
 			ParaId::from(2000),
@@ -931,16 +954,18 @@ fn gap_bids_work() {
 		let duration = 99u32;
 		let lease_period_index_start = 4u32;
 		assert_ok!(Auctions::new_auction(Origin::root(), duration, lease_period_index_start));
-		Balances::make_free_balance_be(&1, 1_000);
-		Balances::make_free_balance_be(&2, 1_000);
+		Balances::make_free_balance_be(&1, 1_000_000_000);
+		Balances::make_free_balance_be(&2, 1_000_000_000);
 
 		// Now register 2 paras
+		assert_ok!(Registrar::reserve(Origin::signed(1)));
 		assert_ok!(Registrar::register(
 			Origin::signed(1),
 			ParaId::from(2000),
 			test_genesis_head(10),
 			test_validation_code(10),
 		));
+		assert_ok!(Registrar::reserve(Origin::signed(2)));
 		assert_ok!(Registrar::register(
 			Origin::signed(2),
 			ParaId::from(2001),
@@ -952,8 +977,8 @@ fn gap_bids_work() {
 		run_to_session(2);
 
 		// Make bids
-		Balances::make_free_balance_be(&10, 1_000);
-		Balances::make_free_balance_be(&20, 1_000);
+		Balances::make_free_balance_be(&10, 1_000_000_000);
+		Balances::make_free_balance_be(&20, 1_000_000_000);
 		// Slot 1 for 100 from 10
 		assert_ok!(Auctions::bid(
 			Origin::signed(10),
@@ -1065,5 +1090,156 @@ fn gap_bids_work() {
 		assert_eq!(slots::Leases::<Test>::get(ParaId::from(2000)), vec![]);
 		assert_eq!(Balances::reserved_balance(&10), 0);
 		assert_eq!(Balances::reserved_balance(&20), 0);
+	});
+}
+
+// This test verifies that if a parachain already has won some lease periods, that it cannot bid for
+// any of those same lease periods again.
+#[test]
+fn cant_bid_on_existing_lease_periods() {
+	new_test_ext().execute_with(|| {
+		assert!(System::block_number().is_one()); // So events are emitted
+		Balances::make_free_balance_be(&1, 1_000_000_000);
+		// First register a parathread
+		assert_ok!(Registrar::reserve(Origin::signed(1)));
+		assert_ok!(Registrar::register(
+			Origin::signed(1),
+			ParaId::from(2000),
+			test_genesis_head(10),
+			test_validation_code(10),
+		));
+
+		// Start a new auction in the future
+		let starting_block = System::block_number();
+		let duration = 99u32;
+		let lease_period_index_start = 4u32;
+		assert_ok!(Auctions::new_auction(Origin::root(), duration, lease_period_index_start));
+
+		// 2 sessions later they are parathreads
+		run_to_session(2);
+
+		// Open a crowdloan for Para 1 for slots 0-3
+		assert_ok!(Crowdloan::create(
+			Origin::signed(1),
+			ParaId::from(2000),
+			1_000_000, // Cap
+			lease_period_index_start + 0, // First Slot
+			lease_period_index_start + 1, // Last Slot
+			400, // Long block end
+			None,
+		));
+		let crowdloan_account = Crowdloan::fund_account_id(ParaId::from(2000));
+
+		// Bunch of contributions
+		let mut total = 0;
+		for i in 10 .. 20 {
+			Balances::make_free_balance_be(&i, 1_000_000_000);
+			assert_ok!(Crowdloan::contribute(Origin::signed(i), ParaId::from(2000), 900 - i, None));
+			total += 900 - i;
+		}
+		assert!(total > 0);
+		assert_eq!(Balances::free_balance(&crowdloan_account), total);
+
+		// Finish the auction.
+		run_to_block(starting_block + 110);
+
+		// Appropriate Paras should have won slots
+		assert_eq!(
+			slots::Leases::<Test>::get(ParaId::from(2000)),
+			// -- 1 --- 2 --- 3 ------------- 4 ------------------------ 5 -------------
+			vec![None, None, None, Some((crowdloan_account, 8855)), Some((crowdloan_account, 8855))],
+		);
+
+		// Let's start another auction for the same range
+		let starting_block = System::block_number();
+		let duration = 99u32;
+		let lease_period_index_start = 4u32;
+		assert_ok!(Auctions::new_auction(Origin::root(), duration, lease_period_index_start));
+
+		// Poke the crowdloan into `NewRaise`
+		assert_ok!(Crowdloan::poke(Origin::signed(1), ParaId::from(2000)));
+		assert_eq!(Crowdloan::new_raise(), vec![ParaId::from(2000)]);
+
+		// Beginning of ending block.
+		run_to_block(starting_block + 100);
+
+		// Bids cannot be made which intersect
+		assert_noop!(
+			Auctions::bid(
+				Origin::signed(crowdloan_account),
+				ParaId::from(2000),
+				2,
+				lease_period_index_start + 0,
+				lease_period_index_start + 1,
+				100,
+			), AuctionsError::<Test>::AlreadyLeasedOut,
+		);
+
+		assert_noop!(
+			Auctions::bid(
+				Origin::signed(crowdloan_account),
+				ParaId::from(2000),
+				2,
+				lease_period_index_start + 1,
+				lease_period_index_start + 2,
+				100,
+			), AuctionsError::<Test>::AlreadyLeasedOut,
+		);
+
+		assert_noop!(
+			Auctions::bid(
+				Origin::signed(crowdloan_account),
+				ParaId::from(2000),
+				2,
+				lease_period_index_start - 1,
+				lease_period_index_start + 0,
+				100,
+			), AuctionsError::<Test>::AlreadyLeasedOut,
+		);
+
+		assert_noop!(
+			Auctions::bid(
+				Origin::signed(crowdloan_account),
+				ParaId::from(2000),
+				2,
+				lease_period_index_start + 0,
+				lease_period_index_start + 0,
+				100,
+			), AuctionsError::<Test>::AlreadyLeasedOut,
+		);
+
+		assert_noop!(
+			Auctions::bid(
+				Origin::signed(crowdloan_account),
+				ParaId::from(2000),
+				2,
+				lease_period_index_start + 1,
+				lease_period_index_start + 1,
+				100,
+			), AuctionsError::<Test>::AlreadyLeasedOut,
+		);
+
+		assert_noop!(
+			Auctions::bid(
+				Origin::signed(crowdloan_account),
+				ParaId::from(2000),
+				2,
+				lease_period_index_start - 1,
+				lease_period_index_start + 5,
+				100,
+			), AuctionsError::<Test>::AlreadyLeasedOut,
+		);
+
+		// Will work when not overlapping
+		assert_ok!(
+			Auctions::bid(
+				Origin::signed(crowdloan_account),
+				ParaId::from(2000),
+				2,
+				lease_period_index_start + 2,
+				lease_period_index_start + 3,
+				100,
+			)
+		);
 	});
 }
