@@ -16,29 +16,69 @@
 
 //! Interface to the Substrate Executor
 
-use std::any::{TypeId, Any};
 use sc_executor_common::{
 	runtime_blob::RuntimeBlob,
 	wasm_runtime::{InvokeMethod, WasmModule as _},
 };
-use sc_executor_wasmtime::{Config, Semantics};
-use sp_core::{
-	storage::{ChildInfo, TrackedStorageKey},
-};
+use sc_executor_wasmtime::{Config, DeterministicStackLimit, Semantics};
+use sp_core::storage::{ChildInfo, TrackedStorageKey};
 use sp_wasm_interface::HostFunctions as _;
+use std::any::{Any, TypeId};
 
 const CONFIG: Config = Config {
-	// TODO: Make sure we don't use more than 1GB: https://github.com/paritytech/polkadot/issues/699
+	// Memory configuration
+	//
+	// When Substrate Runtime is instantiated, a number of wasm pages are mounted for the Substrate
+	// Runtime instance. The number of pages is specified by `heap_pages`.
+	//
+	// Besides `heap_pages` linear memory requests an initial number of pages. Those pages are
+	// typically used for placing the so-called shadow stack and the data section.
+	//
+	// By default, rustc (or `lld` specifically) allocates 1 MiB for the shadow stack. That is, 16
+	// wasm pages.
+	//
+	// Data section for runtimes are typically rather small and can fit in a single digit number of
+	// wasm pages.
+	//
+	// Thus let's assume that 32 pages or 2 MiB are used for these needs.
+	//
+	// Note that the memory limit is specified in bytes, so we multiply this value
+	// by wasm page size -- 64 KiB.
+	max_memory_size: Some((2048 + 32) * 65536),
 	heap_pages: 2048,
+
 	allow_missing_func_imports: true,
 	cache_path: None,
 	semantics: Semantics {
 		fast_instance_reuse: false,
-		stack_depth_metering: false,
+		// Enable deterministic stack limit to pin down the exact number of items the wasmtime stack
+		// can contain before it traps with stack overflow.
+		//
+		// Here is how the values below were chosen.
+		//
+		// At the moment of writing, the default native stack size limit is 1 MiB. Assuming a logical item
+		// (see the docs about the field and the instrumentation algorithm) is 8 bytes, 1 MiB can
+		// fit 2x 65536 logical items.
+		//
+		// Since reaching the native stack limit is undesirable, we halve the logical item limit and
+		// also increase the native 256x. This hopefully should preclude wasm code from reaching
+		// the stack limit set by the wasmtime.
+		deterministic_stack_limit: Some(DeterministicStackLimit {
+			logical_max: 65536,
+			native_stack_max: 256 * 1024 * 1024,
+		}),
+		canonicalize_nans: true,
+		// Rationale for turning the multi-threaded compilation off is to make the preparation time
+		// easily reproducible and as deterministic as possible.
+		//
+		// Currently the prepare queue doesn't distinguish between precheck and prepare requests.
+		// On the one hand, it simplifies the code, on the other, however, slows down compile times
+		// for execute requests. This behavior may change in future.
+		parallel_compilation: false,
 	},
 };
 
-/// Runs the prevaldation on the given code. Returns a [`RuntimeBlob`] if it succeeds.
+/// Runs the prevalidation on the given code. Returns a [`RuntimeBlob`] if it succeeds.
 pub fn prevalidate(code: &[u8]) -> Result<RuntimeBlob, sc_executor_common::error::WasmError> {
 	let blob = RuntimeBlob::new(code)?;
 	// It's assumed this function will take care of any prevalidation logic
@@ -79,9 +119,7 @@ pub unsafe fn execute(
 			CONFIG,
 			HostFunctions::host_functions(),
 		)?;
-		runtime
-			.new_instance()?
-			.call(InvokeMethod::Export("validate_block"), params)
+		runtime.new_instance()?.call(InvokeMethod::Export("validate_block"), params)
 	})?
 }
 
@@ -142,10 +180,6 @@ impl sp_externalities::Externalities for ValidationExternalities {
 		panic!("child_storage_root: unsupported feature for parachain validation")
 	}
 
-	fn storage_changes_root(&mut self, _: &[u8]) -> Result<Option<Vec<u8>>, ()> {
-		panic!("storage_changes_root: unsupported feature for parachain validation")
-	}
-
 	fn next_child_storage_key(&self, _: &ChildInfo, _: &[u8]) -> Option<Vec<u8>> {
 		panic!("next_child_storage_key: unsupported feature for parachain validation")
 	}
@@ -197,6 +231,10 @@ impl sp_externalities::Externalities for ValidationExternalities {
 	fn set_offchain_storage(&mut self, _: &[u8], _: std::option::Option<&[u8]>) {
 		panic!("set_offchain_storage: unsupported feature for parachain validation")
 	}
+
+	fn get_read_and_written_keys(&self) -> Vec<(Vec<u8>, u32, u32, bool)> {
+		panic!("get_read_and_written_keys: unsupported feature for parachain validation")
+	}
 }
 
 impl sp_externalities::ExtensionStore for ValidationExternalities {
@@ -242,11 +280,21 @@ impl TaskExecutor {
 }
 
 impl sp_core::traits::SpawnNamed for TaskExecutor {
-	fn spawn_blocking(&self, _: &'static str, future: futures::future::BoxFuture<'static, ()>) {
+	fn spawn_blocking(
+		&self,
+		_task_name: &'static str,
+		_subsystem_name: Option<&'static str>,
+		future: futures::future::BoxFuture<'static, ()>,
+	) {
 		self.0.spawn_ok(future);
 	}
 
-	fn spawn(&self, _: &'static str, future: futures::future::BoxFuture<'static, ()>) {
+	fn spawn(
+		&self,
+		_task_name: &'static str,
+		_subsystem_name: Option<&'static str>,
+		future: futures::future::BoxFuture<'static, ()>,
+	) {
 		self.0.spawn_ok(future);
 	}
 }

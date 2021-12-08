@@ -14,20 +14,21 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
-use parity_scale_codec::{Encode, Decode};
+use parity_scale_codec::{Decode, Encode};
+use scale_info::TypeInfo;
 
-use sp_std::prelude::Vec;
-#[cfg(feature = "std")]
-use sp_std::convert::TryInto;
 #[cfg(feature = "std")]
 use application_crypto::AppKey;
 #[cfg(feature = "std")]
-use sp_keystore::{CryptoStore, SyncCryptoStorePtr, Error as KeystoreError};
+use sp_keystore::{CryptoStore, Error as KeystoreError, SyncCryptoStorePtr};
+#[cfg(feature = "std")]
+use sp_std::convert::TryInto;
+use sp_std::prelude::Vec;
 
 use primitives::RuntimeDebug;
 use runtime_primitives::traits::AppVerify;
 
-use crate::v0::{SigningContext, ValidatorId, ValidatorSignature, ValidatorIndex};
+use crate::v0::{SigningContext, ValidatorId, ValidatorIndex, ValidatorSignature};
 
 /// Signed data with signature already verified.
 ///
@@ -40,8 +41,15 @@ use crate::v0::{SigningContext, ValidatorId, ValidatorSignature, ValidatorIndex}
 #[derive(Clone, PartialEq, Eq, RuntimeDebug)]
 pub struct Signed<Payload, RealPayload = Payload>(UncheckedSigned<Payload, RealPayload>);
 
+impl<Payload, RealPayload> Signed<Payload, RealPayload> {
+	/// Convert back to an unchecked type.
+	pub fn into_unchecked(self) -> UncheckedSigned<Payload, RealPayload> {
+		self.0
+	}
+}
+
 /// Unchecked signed data, can be converted to `Signed` by checking the signature.
-#[derive(Clone, PartialEq, Eq, RuntimeDebug, Encode, Decode)]
+#[derive(Clone, PartialEq, Eq, RuntimeDebug, Encode, Decode, TypeInfo)]
 pub struct UncheckedSigned<Payload, RealPayload = Payload> {
 	/// The payload is part of the signed data. The rest is the signing context,
 	/// which is known both at signing and at validation.
@@ -95,7 +103,7 @@ impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> Signed<Payload, RealPa
 	pub fn try_from_unchecked<H: Encode>(
 		unchecked: UncheckedSigned<Payload, RealPayload>,
 		context: &SigningContext<H>,
-		key: &ValidatorId
+		key: &ValidatorId,
 	) -> Result<Self, UncheckedSigned<Payload, RealPayload>> {
 		if unchecked.check_signature(context, key).is_ok() {
 			Ok(Self(unchecked))
@@ -134,12 +142,15 @@ impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> Signed<Payload, RealPa
 	}
 
 	/// Convert `Payload` into `RealPayload`.
-	pub fn convert_payload(&self) -> Signed<RealPayload> where for<'a> &'a Payload: Into<RealPayload> {
+	pub fn convert_payload(&self) -> Signed<RealPayload>
+	where
+		for<'a> &'a Payload: Into<RealPayload>,
+	{
 		Signed(self.0.unchecked_convert_payload())
 	}
 }
 
-// We can't bound this on `Payload: Into<RealPayload>` beacuse that conversion consumes
+// We can't bound this on `Payload: Into<RealPayload>` because that conversion consumes
 // the payload, and we don't want that. We can't bound it on `Payload: AsRef<RealPayload>`
 // because there's no blanket impl of `AsRef<T> for T`. In the end, we just invent our
 // own trait which does what we need: EncodeAs.
@@ -153,19 +164,14 @@ impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> UncheckedSigned<Payloa
 		validator_index: ValidatorIndex,
 		signature: ValidatorSignature,
 	) -> Self {
-		Self {
-			payload,
-			validator_index,
-			signature,
-			real_payload: std::marker::PhantomData,
-		}
+		Self { payload, validator_index, signature, real_payload: std::marker::PhantomData }
 	}
 
 	/// Check signature and convert to `Signed` if successful.
 	pub fn try_into_checked<H: Encode>(
 		self,
 		context: &SigningContext<H>,
-		key: &ValidatorId
+		key: &ValidatorId,
 	) -> Result<Signed<Payload, RealPayload>, Self> {
 		Signed::try_from_unchecked(self, context, key)
 	}
@@ -195,7 +201,10 @@ impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> UncheckedSigned<Payloa
 	}
 
 	/// Convert `Payload` into `RealPayload`.
-	pub fn unchecked_convert_payload(&self) -> UncheckedSigned<RealPayload> where for<'a> &'a Payload: Into<RealPayload> {
+	pub fn unchecked_convert_payload(&self) -> UncheckedSigned<RealPayload>
+	where
+		for<'a> &'a Payload: Into<RealPayload>,
+	{
 		UncheckedSigned {
 			signature: self.signature.clone(),
 			validator_index: self.validator_index,
@@ -205,7 +214,7 @@ impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> UncheckedSigned<Payloa
 	}
 
 	fn payload_data<H: Encode>(payload: &Payload, context: &SigningContext<H>) -> Vec<u8> {
-		// equivalent to (real_payload, context).encode()
+		// equivalent to (`real_payload`, context).encode()
 		let mut out = payload.encode_as();
 		out.extend(context.encode());
 		out
@@ -221,15 +230,12 @@ impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> UncheckedSigned<Payloa
 		key: &ValidatorId,
 	) -> Result<Option<Self>, KeystoreError> {
 		let data = Self::payload_data(&payload, context);
-		let signature = CryptoStore::sign_with(
-			&**keystore,
-			ValidatorId::ID,
-			&key.into(),
-			&data,
-		).await?;
+		let signature =
+			CryptoStore::sign_with(&**keystore, ValidatorId::ID, &key.into(), &data).await?;
 
 		let signature = match signature {
-			Some(sig) => sig.try_into().map_err(|_| KeystoreError::KeyNotSupported(ValidatorId::ID))?,
+			Some(sig) =>
+				sig.try_into().map_err(|_| KeystoreError::KeyNotSupported(ValidatorId::ID))?,
 			None => return Ok(None),
 		};
 
@@ -242,24 +248,60 @@ impl<Payload: EncodeAs<RealPayload>, RealPayload: Encode> UncheckedSigned<Payloa
 	}
 
 	/// Validate the payload given the context and public key.
-	fn check_signature<H: Encode>(&self, context: &SigningContext<H>, key: &ValidatorId) -> Result<(), ()> {
+	fn check_signature<H: Encode>(
+		&self,
+		context: &SigningContext<H>,
+		key: &ValidatorId,
+	) -> Result<(), ()> {
 		let data = Self::payload_data(&self.payload, context);
-		if self.signature.verify(data.as_slice(), key) { Ok(()) } else { Err(()) }
+		if self.signature.verify(data.as_slice(), key) {
+			Ok(())
+		} else {
+			Err(())
+		}
 	}
 
+	/// Sign this payload with the given context and pair.
+	#[cfg(any(feature = "runtime-benchmarks", feature = "std"))]
+	pub fn benchmark_sign<H: Encode>(
+		public: &crate::v0::ValidatorId,
+		payload: Payload,
+		context: &SigningContext<H>,
+		validator_index: ValidatorIndex,
+	) -> Self {
+		use application_crypto::RuntimeAppPublic;
+		let data = Self::payload_data(&payload, context);
+		let signature = public.sign(&data).unwrap();
+
+		Self { payload, validator_index, signature, real_payload: sp_std::marker::PhantomData }
+	}
+
+	/// Immutably access the signature.
+	#[cfg(any(feature = "runtime-benchmarks", feature = "std"))]
+	pub fn benchmark_signature(&self) -> ValidatorSignature {
+		self.signature.clone()
+	}
+
+	/// Set the signature. Only should be used for creating testing mocks.
+	#[cfg(feature = "std")]
+	pub fn set_signature(&mut self, signature: ValidatorSignature) {
+		self.signature = signature
+	}
 }
 
-impl<Payload, RealPayload> From<Signed<Payload, RealPayload>> for UncheckedSigned<Payload, RealPayload> {
+impl<Payload, RealPayload> From<Signed<Payload, RealPayload>>
+	for UncheckedSigned<Payload, RealPayload>
+{
 	fn from(signed: Signed<Payload, RealPayload>) -> Self {
 		signed.0
 	}
 }
 
-/// This helper trait ensures that we can encode Statement as CompactStatement,
+/// This helper trait ensures that we can encode `Statement` as `CompactStatement`,
 /// and anything as itself.
 ///
 /// This resembles `parity_scale_codec::EncodeLike`, but it's distinct:
-/// EncodeLike is a marker trait which asserts at the typesystem level that
+/// `EncodeLike` is a marker trait which asserts at the typesystem level that
 /// one type's encoding is a valid encoding for another type. It doesn't
 /// perform any type conversion when encoding.
 ///

@@ -23,8 +23,10 @@ mod common;
 #[test]
 #[cfg(unix)]
 fn purge_chain_works() {
-	use nix::sys::signal::{kill, Signal::SIGINT};
-	use nix::unistd::Pid;
+	use nix::{
+		sys::signal::{kill, Signal::SIGINT},
+		unistd::Pid,
+	};
 
 	let tmpdir = tempdir().expect("could not create temp dir");
 
@@ -54,7 +56,7 @@ fn purge_chain_works() {
 		.unwrap();
 	assert!(status.success());
 
-	// Make sure that the `dev` chain folder exists, but the `db` is deleted.
-	assert!(tmpdir.path().join("chains/dev/").exists());
-	assert!(!tmpdir.path().join("chains/dev/db").exists());
+	// Make sure that the chain folder exists, but `db/full` is deleted.
+	assert!(tmpdir.path().join("chains/dev").exists());
+	assert!(!tmpdir.path().join("chains/dev/db/full").exists());
 }

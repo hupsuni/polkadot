@@ -1,6 +1,6 @@
 # Disputes
 
-## DisputeStatementSet 
+## `DisputeStatementSet`
 
 ```rust
 /// A set of statements about a specific candidate.
@@ -11,7 +11,7 @@ struct DisputeStatementSet {
 }
 ```
 
-## DisputeStatement
+## `DisputeStatement`
 
 ```rust
 /// A statement about a candidate, to be used within some dispute resolution process.
@@ -33,8 +33,8 @@ Kinds of dispute statements. Each of these can be combined with a candidate hash
 ```rust
 enum ValidDisputeStatementKind {
     Explicit,
-    BackingSeconded,
-    BackingValid,
+    BackingSeconded(Hash),
+    BackingValid(Hash),
     ApprovalChecking,
 }
 
@@ -43,7 +43,7 @@ enum InvalidDisputeStatementKind {
 }
 ```
 
-## ExplicitDisputeStatement
+## `ExplicitDisputeStatement`
 
 ```rust
 struct ExplicitDisputeStatement {
@@ -53,7 +53,7 @@ struct ExplicitDisputeStatement {
 }
 ```
 
-## MultiDisputeStatementSet
+## `MultiDisputeStatementSet`
 
 Sets of statements for many (zero or more) disputes.
 
@@ -61,7 +61,7 @@ Sets of statements for many (zero or more) disputes.
 type MultiDisputeStatementSet = Vec<DisputeStatementSet>;
 ```
 
-## DisputeState
+## `DisputeState`
 
 ```rust
 struct DisputeState {
@@ -69,5 +69,22 @@ struct DisputeState {
     validators_against: Bitfield, // one bit per validator.
     start: BlockNumber,
     concluded_at: Option<BlockNumber>,
+}
+```
+
+## `ScrapedOnChainVotes`
+
+```rust
+/// Type for transcending recorded on-chain
+/// dispute relevant votes and conclusions to
+/// the off-chain `DisputesCoordinator`.
+struct ScrapedOnChainVotes {
+    /// The session index at which the block was included.
+    session: SessionIndex,
+    /// The backing and seconding validity attestations for all candidates, provigind the full candidate receipt.
+    backing_validators_per_candidate: Vec<(CandidateReceipt<H>, Vec<(ValidatorIndex, ValidityAttestation)>)>
+    /// Set of concluded disputes that were recorded
+    /// on chain within the inherent.
+    disputes: MultiDisputeStatementSet,
 }
 ```

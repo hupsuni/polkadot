@@ -24,24 +24,31 @@ use futures::{
 	channel::{mpsc, oneshot},
 	prelude::*,
 };
+use futures_timer::Delay;
 use polkadot_node_subsystem::{
-	errors::{ChainApiError, RuntimeApiError}, PerLeafSpan, SubsystemSender, jaeger,
+	errors::{ChainApiError, RuntimeApiError},
+	jaeger,
 	messages::{
-		CandidateBackingMessage, ChainApiMessage, ProvisionableData, ProvisionerInherentData,
-		ProvisionerMessage,
+		CandidateBackingMessage, ChainApiMessage, DisputeCoordinatorMessage, ProvisionableData,
+		ProvisionerInherentData, ProvisionerMessage,
 	},
+	PerLeafSpan, SubsystemSender,
 };
 use polkadot_node_subsystem_util::{
-	self as util, JobSubsystem, JobSender,
-	request_availability_cores, request_persisted_validation_data, JobTrait, metrics::{self, prometheus},
+	self as util, request_availability_cores, request_persisted_validation_data, JobSender,
+	JobSubsystem, JobTrait,
 };
 use polkadot_primitives::v1::{
-	BackedCandidate, BlockNumber, CandidateReceipt, CoreState, Hash, OccupiedCoreAssumption,
+	BackedCandidate, BlockNumber, CandidateReceipt, CoreState, DisputeStatement,
+	DisputeStatementSet, Hash, MultiDisputeStatementSet, OccupiedCoreAssumption,
 	SignedAvailabilityBitfield, ValidatorIndex,
 };
-use std::{pin::Pin, collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 use thiserror::Error;
-use futures_timer::Delay;
+
+mod metrics;
+
+pub use self::metrics::*;
 
 #[cfg(test)]
 mod tests;
@@ -91,7 +98,7 @@ pub struct ProvisioningJob {
 	signed_bitfields: Vec<SignedAvailabilityBitfield>,
 	metrics: Metrics,
 	inherent_after: InherentAfter,
-	awaiting_inherent: Vec<oneshot::Sender<ProvisionerInherentData>>
+	awaiting_inherent: Vec<oneshot::Sender<ProvisionerInherentData>>,
 }
 
 /// Errors in the provisioner.
@@ -113,6 +120,9 @@ pub enum Error {
 	#[error("failed to get backed candidates")]
 	CanceledBackedCandidates(#[source] oneshot::Canceled),
 
+	#[error("failed to get votes on dispute")]
+	CanceledCandidateVotes(#[source] oneshot::Canceled),
+
 	#[error(transparent)]
 	ChainApi(#[from] ChainApiError),
 
@@ -128,7 +138,9 @@ pub enum Error {
 	#[error("failed to send return message with Inherents")]
 	InherentDataReturnChannel,
 
-	#[error("backed candidate does not correspond to selected candidate; check logic in provisioner")]
+	#[error(
+		"backed candidate does not correspond to selected candidate; check logic in provisioner"
+	)]
 	BackedCandidateOrderingProblem,
 }
 
@@ -138,7 +150,7 @@ impl JobTrait for ProvisioningJob {
 	type RunArgs = ();
 	type Metrics = Metrics;
 
-	const NAME: &'static str = "ProvisioningJob";
+	const NAME: &'static str = "provisioner-job";
 
 	/// Run a job for the parent block indicated
 	//
@@ -152,13 +164,10 @@ impl JobTrait for ProvisioningJob {
 		mut sender: JobSender<S>,
 	) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
 		async move {
-			let job = ProvisioningJob::new(
-				relay_parent,
-				metrics,
-				receiver,
-			);
+			let job = ProvisioningJob::new(relay_parent, metrics, receiver);
 
-			job.run_loop(sender.subsystem_sender(), PerLeafSpan::new(span, "provisioner")).await
+			job.run_loop(sender.subsystem_sender(), PerLeafSpan::new(span, "provisioner"))
+				.await
 		}
 		.boxed()
 	}
@@ -186,9 +195,7 @@ impl ProvisioningJob {
 		sender: &mut impl SubsystemSender,
 		span: PerLeafSpan,
 	) -> Result<(), Error> {
-		use ProvisionerMessage::{
-			ProvisionableData, RequestInherentData,
-		};
+		use ProvisionerMessage::{ProvisionableData, RequestInherentData};
 		loop {
 			futures::select! {
 				msg = self.receiver.next() => match msg {
@@ -234,6 +241,7 @@ impl ProvisioningJob {
 			&self.backed_candidates,
 			return_senders,
 			sender,
+			&self.metrics,
 		)
 		.await
 		{
@@ -244,17 +252,21 @@ impl ProvisioningJob {
 		}
 	}
 
-	fn note_provisionable_data(&mut self, span: &jaeger::Span, provisionable_data: ProvisionableData) {
+	fn note_provisionable_data(
+		&mut self,
+		span: &jaeger::Span,
+		provisionable_data: ProvisionableData,
+	) {
 		match provisionable_data {
-			ProvisionableData::Bitfield(_, signed_bitfield) => {
-				self.signed_bitfields.push(signed_bitfield)
-			}
+			ProvisionableData::Bitfield(_, signed_bitfield) =>
+				self.signed_bitfields.push(signed_bitfield),
 			ProvisionableData::BackedCandidate(backed_candidate) => {
-				let _span = span.child("provisionable-backed")
+				let _span = span
+					.child("provisionable-backed")
 					.with_para_id(backed_candidate.descriptor().para_id);
 				self.backed_candidates.push(backed_candidate)
-			}
-			_ => {}
+			},
+			_ => {},
 		}
 	}
 }
@@ -284,28 +296,26 @@ async fn send_inherent_data(
 	candidates: &[CandidateReceipt],
 	return_senders: Vec<oneshot::Sender<ProvisionerInherentData>>,
 	from_job: &mut impl SubsystemSender,
+	metrics: &Metrics,
 ) -> Result<(), Error> {
 	let availability_cores = request_availability_cores(relay_parent, from_job)
 		.await
-		.await.map_err(|err| Error::CanceledAvailabilityCores(err))??;
+		.await
+		.map_err(|err| Error::CanceledAvailabilityCores(err))??;
 
+	let disputes = select_disputes(from_job, metrics).await?;
 	let bitfields = select_availability_bitfields(&availability_cores, bitfields);
-	let candidates = select_candidates(
-		&availability_cores,
-		&bitfields,
-		candidates,
-		relay_parent,
-		from_job,
-	).await?;
+	let candidates =
+		select_candidates(&availability_cores, &bitfields, candidates, relay_parent, from_job)
+			.await?;
 
-	let inherent_data = ProvisionerInherentData {
-		bitfields,
-		backed_candidates: candidates,
-		disputes: Vec::new(), // until disputes are implemented.
-	};
+	let inherent_data =
+		ProvisionerInherentData { bitfields, backed_candidates: candidates, disputes };
 
 	for return_sender in return_senders {
-		return_sender.send(inherent_data.clone()).map_err(|_data| Error::InherentDataReturnChannel)?;
+		return_sender
+			.send(inherent_data.clone())
+			.map_err(|_data| Error::InherentDataReturnChannel)?;
 	}
 
 	Ok(())
@@ -327,16 +337,18 @@ fn select_availability_bitfields(
 ) -> Vec<SignedAvailabilityBitfield> {
 	let mut selected: BTreeMap<ValidatorIndex, SignedAvailabilityBitfield> = BTreeMap::new();
 
-	'a:
-	for bitfield in bitfields.iter().cloned() {
+	'a: for bitfield in bitfields.iter().cloned() {
 		if bitfield.payload().0.len() != cores.len() {
 			continue
 		}
 
-		let is_better = selected.get(&bitfield.validator_index())
+		let is_better = selected
+			.get(&bitfield.validator_index())
 			.map_or(true, |b| b.payload().0.count_ones() < bitfield.payload().0.count_ones());
 
-		if !is_better { continue }
+		if !is_better {
+			continue
+		}
 
 		for (idx, _) in cores.iter().enumerate().filter(|v| !v.1.is_occupied()) {
 			// Bit is set for an unoccupied core - invalid
@@ -368,23 +380,24 @@ async fn select_candidates(
 		let (scheduled_core, assumption) = match core {
 			CoreState::Scheduled(scheduled_core) => (scheduled_core, OccupiedCoreAssumption::Free),
 			CoreState::Occupied(occupied_core) => {
-				if bitfields_indicate_availability(core_idx, bitfields, &occupied_core.availability) {
+				if bitfields_indicate_availability(core_idx, bitfields, &occupied_core.availability)
+				{
 					if let Some(ref scheduled_core) = occupied_core.next_up_on_available {
 						(scheduled_core, OccupiedCoreAssumption::Included)
 					} else {
-						continue;
+						continue
 					}
 				} else {
 					if occupied_core.time_out_at != block_number {
-						continue;
+						continue
 					}
 					if let Some(ref scheduled_core) = occupied_core.next_up_on_time_out {
 						(scheduled_core, OccupiedCoreAssumption::TimedOut)
 					} else {
-						continue;
+						continue
 					}
 				}
-			}
+			},
 			CoreState::Free => continue,
 		};
 
@@ -395,7 +408,8 @@ async fn select_candidates(
 			sender,
 		)
 		.await
-		.await.map_err(|err| Error::CanceledPersistedValidationData(err))??
+		.await
+		.map_err(|err| Error::CanceledPersistedValidationData(err))??
 		{
 			Some(v) => v,
 			None => continue,
@@ -406,8 +420,8 @@ async fn select_candidates(
 		// we arbitrarily pick the first of the backed candidates which match the appropriate selection criteria
 		if let Some(candidate) = candidates.iter().find(|backed_candidate| {
 			let descriptor = &backed_candidate.descriptor;
-			descriptor.para_id == scheduled_core.para_id
-				&& descriptor.persisted_validation_data_hash == computed_validation_data_hash
+			descriptor.para_id == scheduled_core.para_id &&
+				descriptor.persisted_validation_data_hash == computed_validation_data_hash
 		}) {
 			let candidate_hash = candidate.hash();
 			tracing::trace!(
@@ -424,11 +438,16 @@ async fn select_candidates(
 
 	// now get the backed candidates corresponding to these candidate receipts
 	let (tx, rx) = oneshot::channel();
-	sender.send_message(CandidateBackingMessage::GetBackedCandidates(
-		relay_parent,
-		selected_candidates.clone(),
-		tx,
-	).into()).await;
+	sender
+		.send_message(
+			CandidateBackingMessage::GetBackedCandidates(
+				relay_parent,
+				selected_candidates.clone(),
+				tx,
+			)
+			.into(),
+		)
+		.await;
 	let mut candidates = rx.await.map_err(|err| Error::CanceledBackedCandidates(err))?;
 
 	// `selected_candidates` is generated in ascending order by core index, and `GetBackedCandidates`
@@ -439,7 +458,9 @@ async fn select_candidates(
 	// in order, we can ensure that the backed candidates are also in order.
 	let mut backed_idx = 0;
 	for selected in selected_candidates {
-		if selected == candidates.get(backed_idx).ok_or(Error::BackedCandidateOrderingProblem)?.hash() {
+		if selected ==
+			candidates.get(backed_idx).ok_or(Error::BackedCandidateOrderingProblem)?.hash()
+		{
 			backed_idx += 1;
 		}
 	}
@@ -478,12 +499,7 @@ async fn get_block_number_under_construction(
 	sender: &mut impl SubsystemSender,
 ) -> Result<BlockNumber, Error> {
 	let (tx, rx) = oneshot::channel();
-	sender
-		.send_message(ChainApiMessage::BlockNumber(
-			relay_parent,
-			tx,
-		).into())
-		.await;
+	sender.send_message(ChainApiMessage::BlockNumber(relay_parent, tx).into()).await;
 
 	match rx.await.map_err(|err| Error::CanceledBlockNumber(err))? {
 		Ok(Some(n)) => Ok(n + 1),
@@ -522,8 +538,8 @@ fn bitfields_indicate_availability(
 					availability_len,
 				);
 
-				return false;
-			}
+				return false
+			},
 			Some(mut bit_mut) => *bit_mut |= bitfield.payload().0[core_idx],
 		}
 	}
@@ -531,74 +547,80 @@ fn bitfields_indicate_availability(
 	3 * availability.count_ones() >= 2 * availability.len()
 }
 
-#[derive(Clone)]
-struct MetricsInner {
-	inherent_data_requests: prometheus::CounterVec<prometheus::U64>,
-	request_inherent_data: prometheus::Histogram,
-	provisionable_data: prometheus::Histogram,
-}
+async fn select_disputes(
+	sender: &mut impl SubsystemSender,
+	metrics: &metrics::Metrics,
+) -> Result<MultiDisputeStatementSet, Error> {
+	let (tx, rx) = oneshot::channel();
 
-/// Provisioner metrics.
-#[derive(Default, Clone)]
-pub struct Metrics(Option<MetricsInner>);
+	// We use `RecentDisputes` instead of `ActiveDisputes` because redundancy is fine.
+	// It's heavier than `ActiveDisputes` but ensures that everything from the dispute
+	// window gets on-chain, unlike `ActiveDisputes`.
+	//
+	// This should have no meaningful impact on performance on production networks for
+	// two reasons:
+	// 1. In large validator sets, a node might be a block author 1% or less of the time.
+	//    this code-path only triggers in the case of being a block author.
+	// 2. Disputes are expected to be rare because they come with heavy slashing.
+	sender.send_message(DisputeCoordinatorMessage::RecentDisputes(tx).into()).await;
 
-impl Metrics {
-	fn on_inherent_data_request(&self, response: Result<(), ()>) {
-		if let Some(metrics) = &self.0 {
-			match response {
-				Ok(()) => metrics.inherent_data_requests.with_label_values(&["succeeded"]).inc(),
-				Err(()) => metrics.inherent_data_requests.with_label_values(&["failed"]).inc(),
-			}
+	let recent_disputes = match rx.await {
+		Ok(r) => r,
+		Err(oneshot::Canceled) => {
+			tracing::debug!(
+				target: LOG_TARGET,
+				"Unable to gather recent disputes - subsystem disconnected?",
+			);
+
+			Vec::new()
+		},
+	};
+
+	// Load all votes for all disputes from the coordinator.
+	let dispute_candidate_votes = {
+		let (tx, rx) = oneshot::channel();
+		sender
+			.send_message(
+				DisputeCoordinatorMessage::QueryCandidateVotes(recent_disputes, tx).into(),
+			)
+			.await;
+
+		match rx.await {
+			Ok(v) => v,
+			Err(oneshot::Canceled) => {
+				tracing::debug!(
+					target: LOG_TARGET,
+					"Unable to query candidate votes - subsystem disconnected?",
+				);
+				Vec::new()
+			},
 		}
-	}
+	};
 
-	/// Provide a timer for `request_inherent_data` which observes on drop.
-	fn time_request_inherent_data(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.request_inherent_data.start_timer())
-	}
+	// Transform all `CandidateVotes` into `MultiDisputeStatementSet`.
+	Ok(dispute_candidate_votes
+		.into_iter()
+		.map(|(session_index, candidate_hash, votes)| {
+			let valid_statements =
+				votes.valid.into_iter().map(|(s, i, sig)| (DisputeStatement::Valid(s), i, sig));
 
-	/// Provide a timer for `provisionable_data` which observes on drop.
-	fn time_provisionable_data(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
-		self.0.as_ref().map(|metrics| metrics.provisionable_data.start_timer())
-	}
+			let invalid_statements = votes
+				.invalid
+				.into_iter()
+				.map(|(s, i, sig)| (DisputeStatement::Invalid(s), i, sig));
+
+			metrics.inc_valid_statements_by(valid_statements.len());
+			metrics.inc_invalid_statements_by(invalid_statements.len());
+			metrics.inc_dispute_statement_sets_by(1);
+
+			DisputeStatementSet {
+				candidate_hash,
+				session: session_index,
+				statements: valid_statements.chain(invalid_statements).collect(),
+			}
+		})
+		.collect())
 }
-
-impl metrics::Metrics for Metrics {
-	fn try_register(registry: &prometheus::Registry) -> Result<Self, prometheus::PrometheusError> {
-		let metrics = MetricsInner {
-			inherent_data_requests: prometheus::register(
-				prometheus::CounterVec::new(
-					prometheus::Opts::new(
-						"parachain_inherent_data_requests_total",
-						"Number of InherentData requests served by provisioner.",
-					),
-					&["success"],
-				)?,
-				registry,
-			)?,
-			request_inherent_data: prometheus::register(
-				prometheus::Histogram::with_opts(
-					prometheus::HistogramOpts::new(
-						"parachain_provisioner_request_inherent_data",
-						"Time spent within `provisioner::request_inherent_data`",
-					)
-				)?,
-				registry,
-			)?,
-			provisionable_data: prometheus::register(
-				prometheus::Histogram::with_opts(
-					prometheus::HistogramOpts::new(
-						"parachain_provisioner_provisionable_data",
-						"Time spent within `provisioner::provisionable_data`",
-					)
-				)?,
-				registry,
-			)?,
-		};
-		Ok(Metrics(Some(metrics)))
-	}
-}
-
 
 /// The provisioning subsystem.
 pub type ProvisioningSubsystem<Spawner> = JobSubsystem<ProvisioningJob, Spawner>;

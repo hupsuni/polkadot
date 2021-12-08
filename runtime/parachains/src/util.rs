@@ -18,9 +18,9 @@
 //! on all modules.
 
 use primitives::v1::{Id as ParaId, PersistedValidationData, ValidatorIndex};
-use sp_std::vec::Vec;
+use sp_std::{collections::btree_set::BTreeSet, vec::Vec};
 
-use crate::{configuration, paras, hrmp};
+use crate::{configuration, hrmp, paras};
 
 /// Make the persisted validation data for a particular parachain, a specified relay-parent and it's
 /// storage root.
@@ -31,24 +31,63 @@ pub fn make_persisted_validation_data<T: paras::Config + hrmp::Config>(
 	relay_parent_number: T::BlockNumber,
 	relay_parent_storage_root: T::Hash,
 ) -> Option<PersistedValidationData<T::Hash, T::BlockNumber>> {
-	let config = <configuration::Module<T>>::config();
+	let config = <configuration::Pallet<T>>::config();
 
 	Some(PersistedValidationData {
-		parent_head: <paras::Module<T>>::para_head(&para_id)?,
+		parent_head: <paras::Pallet<T>>::para_head(&para_id)?,
 		relay_parent_number,
 		relay_parent_storage_root,
 		max_pov_size: config.max_pov_size,
 	})
 }
 
-/// Take the active subset of a set containing all validators.
-pub fn take_active_subset<T: Clone>(active_validators: &[ValidatorIndex], set: &[T]) -> Vec<T> {
-	let subset: Vec<_> = active_validators.iter()
-		.filter_map(|i| set.get(i.0 as usize))
+/// Take an active subset of a set containing all validators.
+///
+/// First item in pair will be all items in set have indices found in the `active` indices set (in
+/// the order of the `active` vec, the second item will contain the rest, in the original order.
+///
+/// ```ignore
+///		split_active_subset(active, all).0 == take_active_subset(active, all)
+/// ```
+pub fn split_active_subset<T: Clone>(active: &[ValidatorIndex], all: &[T]) -> (Vec<T>, Vec<T>) {
+	let active_set: BTreeSet<_> = active.iter().cloned().collect();
+	// active result has ordering of active set.
+	let active_result = take_active_subset(active, all);
+	// inactive result preserves original ordering of `all`.
+	let inactive_result = all
+		.iter()
+		.enumerate()
+		.filter(|(i, _)| !active_set.contains(&ValidatorIndex(*i as _)))
+		.map(|(_, v)| v)
 		.cloned()
 		.collect();
 
-	if subset.len() != active_validators.len() {
+	if active_result.len() != active.len() {
+		log::warn!(
+			target: "runtime::parachains",
+			"Took active validators from set with wrong size.",
+		);
+	}
+
+	(active_result, inactive_result)
+}
+
+/// Uses `split_active_subset` and concatenates the inactive to the active vec.
+///
+/// ```ignore
+///		split_active_subset(active, all)[0..active.len()]) == take_active_subset(active, all)
+/// ```
+pub fn take_active_subset_and_inactive<T: Clone>(active: &[ValidatorIndex], all: &[T]) -> Vec<T> {
+	let (mut a, mut i) = split_active_subset(active, all);
+	a.append(&mut i);
+	a
+}
+
+/// Take the active subset of a set containing all validators.
+pub fn take_active_subset<T: Clone>(active: &[ValidatorIndex], set: &[T]) -> Vec<T> {
+	let subset: Vec<_> = active.iter().filter_map(|i| set.get(i.0 as usize)).cloned().collect();
+
+	if subset.len() != active.len() {
 		log::warn!(
 			target: "runtime::parachains",
 			"Took active validators from set with wrong size",
@@ -56,4 +95,24 @@ pub fn take_active_subset<T: Clone>(active_validators: &[ValidatorIndex], set: &
 	}
 
 	subset
+}
+
+#[cfg(test)]
+mod tests {
+
+	use sp_std::vec::Vec;
+
+	use crate::util::{split_active_subset, take_active_subset};
+	use primitives::v1::ValidatorIndex;
+
+	#[test]
+	fn take_active_subset_is_compatible_with_split_active_subset() {
+		let active: Vec<_> = vec![ValidatorIndex(1), ValidatorIndex(7), ValidatorIndex(3)];
+		let validators = vec![9, 1, 6, 7, 4, 5, 2, 3, 0, 8];
+		let (selected, unselected) = split_active_subset(&active, &validators);
+		let selected2 = take_active_subset(&active, &validators);
+		assert_eq!(selected, selected2);
+		assert_eq!(unselected, vec![9, 6, 4, 5, 2, 0, 8]);
+		assert_eq!(selected, vec![1, 3, 7]);
+	}
 }

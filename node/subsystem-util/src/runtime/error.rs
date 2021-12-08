@@ -17,29 +17,22 @@
 
 //! Error handling related code and Error/Result definitions.
 
-use thiserror::Error;
 use futures::channel::oneshot;
+use thiserror::Error;
 
 use polkadot_node_subsystem::errors::RuntimeApiError;
 use polkadot_primitives::v1::SessionIndex;
 
-use crate::Fault;
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors for `Runtime` cache.
-pub type Error = Fault<NonFatal, Fatal>;
-
-impl From<NonFatal> for Error {
-	fn from(e: NonFatal) -> Self {
-		Self::from_non_fatal(e)
-	}
-}
-
-impl From<Fatal> for Error {
-	fn from(f: Fatal) -> Self {
-		Self::from_fatal(f)
-	}
+#[derive(Debug, Error, derive_more::From)]
+#[error(transparent)]
+pub enum Error {
+	/// All fatal errors.
+	Fatal(Fatal),
+	/// All nonfatal/potentially recoverable errors.
+	NonFatal(NonFatal),
 }
 
 /// Fatal runtime errors.
@@ -55,11 +48,11 @@ pub enum Fatal {
 pub enum NonFatal {
 	/// Some request to the runtime failed.
 	/// For example if we prune a block we're requesting info about.
-	#[error("Runtime API error")]
+	#[error("Runtime API error {0}")]
 	RuntimeRequest(RuntimeApiError),
 
 	/// We tried fetching a session info which was not available.
-	#[error("There was no session with the given index")]
+	#[error("There was no session with the given index {0}")]
 	NoSuchSession(SessionIndex),
 }
 
@@ -67,7 +60,8 @@ pub enum NonFatal {
 pub(crate) async fn recv_runtime<V>(
 	r: oneshot::Receiver<std::result::Result<V, RuntimeApiError>>,
 ) -> Result<V> {
-	let result = r.await
+	let result = r
+		.await
 		.map_err(Fatal::RuntimeRequestCanceled)?
 		.map_err(NonFatal::RuntimeRequest)?;
 	Ok(result)

@@ -14,15 +14,19 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
-use polkadot_node_core_pvf::{Pvf, ValidationHost, start, Config, InvalidCandidate, ValidationError};
-use polkadot_parachain::primitives::{BlockData, ValidationParams, ValidationResult};
-use parity_scale_codec::Encode as _;
 use async_std::sync::Mutex;
+use parity_scale_codec::Encode as _;
+use polkadot_node_core_pvf::{
+	start, Config, InvalidCandidate, Metrics, Pvf, ValidationError, ValidationHost,
+};
+use polkadot_parachain::primitives::{BlockData, ValidationParams, ValidationResult};
+use std::time::Duration;
 
 mod adder;
 mod worker_common;
 
 const PUPPET_EXE: &str = env!("CARGO_BIN_EXE_puppet_worker");
+const TEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct TestHost {
 	_cache_dir: tempfile::TempDir,
@@ -42,12 +46,9 @@ impl TestHost {
 		let program_path = std::path::PathBuf::from(PUPPET_EXE);
 		let mut config = Config::new(cache_dir.path().to_owned(), program_path);
 		f(&mut config);
-		let (host, task) = start(config);
+		let (host, task) = start(config, Metrics::default());
 		let _ = async_std::task::spawn(task);
-		Self {
-			_cache_dir: cache_dir,
-			host: Mutex::new(host),
-		}
+		Self { _cache_dir: cache_dir, host: Mutex::new(host) }
 	}
 
 	async fn validate_candidate(
@@ -57,13 +58,15 @@ impl TestHost {
 	) -> Result<ValidationResult, ValidationError> {
 		let (result_tx, result_rx) = futures::channel::oneshot::channel();
 
-		let code = sp_maybe_compressed_blob::decompress(code, 16 * 1024 * 1024).expect("Compression works");
+		let code = sp_maybe_compressed_blob::decompress(code, 16 * 1024 * 1024)
+			.expect("Compression works");
 
 		self.host
 			.lock()
 			.await
 			.execute_pvf(
 				Pvf::from_code(code.into()),
+				TEST_EXECUTION_TIMEOUT,
 				params.encode(),
 				polkadot_node_core_pvf::Priority::Normal,
 				result_tx,
@@ -91,7 +94,7 @@ async fn terminates_on_timeout() {
 		.await;
 
 	match result {
-		Err(ValidationError::InvalidCandidate(InvalidCandidate::HardTimeout)) => {}
+		Err(ValidationError::InvalidCandidate(InvalidCandidate::HardTimeout)) => {},
 		r => panic!("{:?}", r),
 	}
 }
@@ -124,15 +127,15 @@ async fn parallel_execution() {
 	// total time should be < 2 x EXECUTION_TIMEOUT_SEC
 	const EXECUTION_TIMEOUT_SEC: u64 = 3;
 	assert!(
-		std::time::Instant::now().duration_since(start)
-			< std::time::Duration::from_secs(EXECUTION_TIMEOUT_SEC * 2)
+		std::time::Instant::now().duration_since(start) <
+			std::time::Duration::from_secs(EXECUTION_TIMEOUT_SEC * 2)
 	);
 }
 
 #[async_std::test]
 async fn execute_queue_doesnt_stall_if_workers_died() {
 	let host = TestHost::new_with_config(|cfg| {
-		assert_eq!(cfg.execute_workers_max_num, 5);
+		cfg.execute_workers_max_num = 5;
 	});
 
 	// Here we spawn 8 validation jobs for the `halt` PVF and share those between 5 workers. The

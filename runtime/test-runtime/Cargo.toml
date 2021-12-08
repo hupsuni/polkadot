@@ -1,22 +1,23 @@
 [package]
 name = "polkadot-test-runtime"
-version = "0.9.8"
+version = "0.9.13"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2018"
 build = "build.rs"
 
 [dependencies]
 bitvec = { version = "0.20.1", default-features = false, features = ["alloc"] }
-parity-scale-codec = { version = "2.0.0", default-features = false, features = ["derive"] }
+parity-scale-codec = { version = "2.3.1", default-features = false, features = ["derive"] }
 log = { version = "0.4.14", default-features = false }
 rustc-hex = { version = "2.1.0", default-features = false }
-serde = { version = "1.0.123", default-features = false }
+scale-info = { version = "1.0", default-features = false, features = ["derive"] }
+serde = { version = "1.0.130", default-features = false }
 serde_derive = { version = "1.0.117", optional = true }
 smallvec = "1.6.1"
 
 authority-discovery-primitives = { package = "sp-authority-discovery", git = "https://github.com/paritytech/substrate", branch = "master", default-features = false }
 babe-primitives = { package = "sp-consensus-babe", git = "https://github.com/paritytech/substrate", branch = "master", default-features = false }
-beefy-primitives = { git = "https://github.com/paritytech/grandpa-bridge-gadget", branch = "master", default-features = false }
+beefy-primitives = { git = "https://github.com/paritytech/substrate", branch = "master", default-features = false }
 sp-api = { git = "https://github.com/paritytech/substrate", branch = "master", default-features = false }
 inherents = { package = "sp-inherents", git = "https://github.com/paritytech/substrate", branch = "master", default-features = false }
 offchain-primitives = { package = "sp-offchain", git = "https://github.com/paritytech/substrate", branch = "master", default-features = false }
@@ -55,16 +56,19 @@ pallet-vesting = { git = "https://github.com/paritytech/substrate", branch = "ma
 
 runtime-common = { package = "polkadot-runtime-common", path = "../common", default-features = false }
 primitives = { package = "polkadot-primitives", path = "../../primitives", default-features = false }
+pallet-xcm = { path = "../../xcm/pallet-xcm", default-features = false }
 polkadot-parachain = { path = "../../parachain", default-features = false }
 polkadot-runtime-parachains = { path = "../parachains", default-features = false }
+xcm-builder = { path = "../../xcm/xcm-builder", default-features = false }
+xcm-executor = { path = "../../xcm/xcm-executor", default-features = false }
+xcm = { path = "../../xcm", default-features = false }
 
 [dev-dependencies]
-hex-literal = "0.3.1"
-libsecp256k1 = "0.3.5"
+hex-literal = "0.3.4"
 tiny-keccak = "2.0.2"
 keyring = { package = "sp-keyring", git = "https://github.com/paritytech/substrate", branch = "master" }
 sp-trie = { git = "https://github.com/paritytech/substrate", branch = "master" }
-serde_json = "1.0.61"
+serde_json = "1.0.72"
 
 [build-dependencies]
 substrate-wasm-builder = { git = "https://github.com/paritytech/substrate", branch = "master" }
@@ -80,9 +84,14 @@ std = [
 	"primitives/std",
 	"rustc-hex/std",
 	"parity-scale-codec/std",
+	"scale-info/std",
 	"inherents/std",
 	"sp-core/std",
 	"polkadot-parachain/std",
+	"pallet-xcm/std",
+	"xcm-builder/std",
+	"xcm-executor/std",
+	"xcm/std",
 	"sp-api/std",
 	"tx-pool-api/std",
 	"block-builder-api/std",

@@ -81,7 +81,7 @@ enum PoVDistributionV1Message {
 	/// specific relay-parent hash.
 	Awaiting(Hash, Vec<Hash>),
 	/// Notification of an awaited PoV, in a given relay-parent context.
-	/// (relay_parent, pov_hash, pov)
+	/// (`relay_parent`, `pov_hash`, `pov`)
 	SendPoV(Hash, Hash, PoV),
 }
 ```
@@ -144,7 +144,7 @@ These updates are posted from the [Network Bridge Subsystem](../node/utility/net
 ```rust
 enum NetworkBridgeEvent<M> {
 	/// A peer with given ID is now connected.
-	PeerConnected(PeerId, ObservedRole),
+	PeerConnected(PeerId, ObservedRole, Option<HashSet<AuthorityDiscoveryId>>),
 	/// A peer with given ID is now disconnected.
 	PeerDisconnected(PeerId),
 	/// Our neighbors in the new gossip topology.

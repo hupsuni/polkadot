@@ -69,7 +69,6 @@ enum AllMessages {
     ApprovalDistribution(ApprovalDistributionMessage),
     GossipSupport(GossipSupportMessage),
     DisputeCoordinator(DisputeCoordinatorMessage),
-    DisputeParticipation(DisputeParticipationMessage),
     ChainSelection(ChainSelectionMessage),
 }
 ```
@@ -326,7 +325,7 @@ enum ChainApiMessage {
     BlockHeader(Hash, ResponseChannel<Result<Option<BlockHeader>, Error>>),
     /// Get the cumulative weight of the given block, by hash.
     /// If the block or weight is unknown, this returns `None`.
-    /// 
+    ///
     /// Weight is used for comparing blocks in a fork-choice rule.
     BlockWeight(Hash, ResponseChannel<Result<Option<Weight>, Error>>),
     /// Get the finalized block hash by number.
@@ -387,7 +386,7 @@ enum CollatorProtocolMessage {
     ///
     /// The result sender should be informed when at least one parachain validator seconded the collation. It is also
     /// completely okay to just drop the sender.
-    DistributeCollation(CandidateReceipt, PoV, Option<oneshot::Sender<SignedFullStatement>>),
+    DistributeCollation(CandidateReceipt, PoV, Option<oneshot::Sender<CollationSecondedSignal>>),
     /// Fetch a collation under the given relay-parent for the given ParaId.
     FetchCollation(Hash, ParaId, ResponseChannel<(CandidateReceipt, PoV)>),
     /// Report a collator as having provided an invalid collation. This should lead to disconnect
@@ -438,9 +437,13 @@ enum DisputeCoordinatorMessage {
         /// This is, we either discarded the votes, just record them because we
         /// casted our vote already or recovered availability for the candidate
         /// successfully.
-        pending_confirmation: oneshot::Sender<()>,
+        pending_confirmation: oneshot::Sender<ImportStatementsResult>
     },
+    /// Fetch a list of all recent disputes that the co-ordinator is aware of.
+    /// These are disputes which have occurred any time in recent sessions, which may have already concluded.
+    RecentDisputes(ResponseChannel<Vec<(SessionIndex, CandidateHash)>>),
     /// Fetch a list of all active disputes that the co-ordinator is aware of.
+    /// These disputes are either unconcluded or recently concluded.
     ActiveDisputes(ResponseChannel<Vec<(SessionIndex, CandidateHash)>>),
     /// Get candidate votes for a candidate.
     QueryCandidateVotes(SessionIndex, CandidateHash, ResponseChannel<Option<CandidateVotes>>),
@@ -459,29 +462,16 @@ enum DisputeCoordinatorMessage {
         rx: ResponseSender<Option<(BlockNumber, BlockHash)>>,
     }
 }
-```
 
-## Dispute Participation Message
-
-Messages received by the [Dispute Participation subsystem](../node/disputes/dispute-participation.md)
-
-This subsystem simply executes requests to evaluate a candidate.
-
-```rust
-enum DisputeParticipationMessage {
-    /// Validate a candidate for the purposes of participating in a dispute.
-    Participate {
-        /// The hash of the candidate
-        candidate_hash: CandidateHash,
-        /// The candidate receipt itself.
-        candidate_receipt: CandidateReceipt,
-        /// The session the candidate appears in.
-        session: SessionIndex,
-        /// The number of validators in the session.
-        n_validators: u32,
-    }
+/// Result of `ImportStatements`.
+pub enum ImportStatementsResult {
+	/// Import was invalid (candidate was not available)  and the sending peer should get banned.
+	InvalidImport,
+	/// Import was valid and can be confirmed to peer.
+	ValidImport
 }
 ```
+
 
 ## Dispute Distribution Message
 
@@ -507,9 +497,6 @@ enum DisputeDistributionMessage {
     /// referenced session.
     from_validator: Option<ValidatorIndex>,
   }
-  /// Tell the subsystem that a candidate is not available. Dispute distribution
-  /// can punish peers distributing votes on unavailable hashes.
-  ReportCandidateUnavailable(CandidateHash),
 }
 ```
 
@@ -555,7 +542,7 @@ enum NetworkBridgeMessage {
     /// `PeerConnected` events from the network bridge.
     ConnectToValidators {
         /// Ids of the validators to connect to.
-        validator_ids: Vec<AuthorityDiscoveryId>,
+        validator_ids: HashSet<AuthorityDiscoveryId>,
         /// The underlying protocol to use for this request.
         peer_set: PeerSet,
         /// Sends back the number of `AuthorityDiscoveryId`s which
@@ -687,7 +674,7 @@ The Runtime API subsystem is responsible for providing an interface to the state
 
 This is fueled by an auxiliary type encapsulating all request types defined in the Runtime API section of the guide.
 
-> TODO: link to the Runtime API section. Not possible currently because of https://github.com/Michael-F-Bryan/mdbook-linkcheck/issues/25. Once v0.7.1 is released it will work.
+> To do: link to the Runtime API section. Not possible currently because of https://github.com/Michael-F-Bryan/mdbook-linkcheck/issues/25. Once v0.7.1 is released it will work.
 
 ```rust
 enum RuntimeApiRequest {
@@ -773,6 +760,9 @@ enum ValidationResult {
     Invalid,
 }
 
+const BACKING_EXECUTION_TIMEOUT: Duration = 2 seconds;
+const APPROVAL_EXECUTION_TIMEOUT: Duration = 6 seconds;
+
 /// Messages received by the Validation subsystem.
 ///
 /// ## Validation Requests
@@ -795,6 +785,7 @@ pub enum CandidateValidationMessage {
     ValidateFromChainState(
         CandidateDescriptor,
         Arc<PoV>,
+        Duration, // Execution timeout.
         oneshot::Sender<Result<ValidationResult, ValidationFailed>>,
     ),
     /// Validate a candidate with provided, exhaustive parameters for validation.
@@ -811,6 +802,7 @@ pub enum CandidateValidationMessage {
         ValidationCode,
         CandidateDescriptor,
         Arc<PoV>,
+        Duration, // Execution timeout.
         oneshot::Sender<Result<ValidationResult, ValidationFailed>>,
     ),
 }
